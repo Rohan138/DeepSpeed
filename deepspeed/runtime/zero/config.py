@@ -3,10 +3,10 @@
 
 # DeepSpeed Team
 
-from pydantic import Field, validator
 import sys
 from typing import Optional
 from enum import Enum
+from deepspeed.pydantic_v1 import Field, validator, root_validator
 from deepspeed.runtime.config_utils import get_scalar_param, pp_int, DeepSpeedConfigModel
 from deepspeed.utils import logger
 from .offload_config import DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig, OffloadDeviceEnum
@@ -20,7 +20,9 @@ ZeRO optimization should be enabled as:
     "stage": [0|1|2],
     "stage3_max_live_parameters" : 1000000000,
     "stage3_max_reuse_distance" : 1000000000,
+    "stage3_use_all_reduce_for_fetch_params": [true|false],
     "allgather_partitions": [true|false],
+    "use_multi_rank_bucket_allreduce": [true|false],
     "allgather_bucket_size": 500000000,
     "reduce_scatter": [true|false],
     "contiguous_gradients" : [true|false]
@@ -105,6 +107,13 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
     Number of elements reduced/allreduced at a time. Limits the memory required
     for the allgather for large model sizes
+    """
+
+    use_multi_rank_bucket_allreduce: bool = True
+    """
+    Combine the reduce buckets of the different ranks and do an All-Reduce instead of multiple Reduce ops.
+    This feature is useful when the model is small and we want to scale it on too many GPUs which therefore
+    reduces the message sizes of each packet.
     """
 
     allgather_partitions: bool = True
@@ -226,6 +235,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     this option is enabled and then saves the fp16 model weights.
     """
 
+    use_all_reduce_for_fetch_params: bool = Field(False, alias="stage3_use_all_reduce_for_fetch_params")
+    """
+    Use all_reduce op when fetching module parameters at stage3. This improves performance by reducing
+    the overhead of concatenation and slicing on the host.
+    """
+
     stage3_gather_fp16_weights_on_model_save: bool = Field(False,
                                                            deprecated=True,
                                                            new_param="gather_16bit_weights_on_model_save")
@@ -236,7 +251,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Unused parameters in modules may be unexpected in static networks, but
     could be normal in dynamic networks. This controls whether or not training
     should terminate with an error message when unused parameters are detected.
-    This is set to ``False`` by default, which means unused parameters are
+    This is set to ``True`` by default, which means unused parameters are
     ignored and training continues. Now is just used in stage 2.
     """
 
@@ -300,3 +315,10 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
             assert ("stage" in values), "DeepSpeedZeroConfig: 'stage' must be defined before 'overlap_comm'"
             field_value = values["stage"] == ZeroStageEnum.weights
         return field_value
+
+    @root_validator
+    def offload_ratio_check(cls, values):
+        offload_config = getattr(values, "offload_optimizer", {})
+        if offload_config and offload_config.ratio < 1.0:
+            assert values.get("stage") == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
+        return values
